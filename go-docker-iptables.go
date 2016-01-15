@@ -1,21 +1,26 @@
 package main
 
 import (
-//	"github.com/vishvananda/netns"
+	"github.com/vishvananda/netns"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"encoding/json"
 	"strings"
-//	"runtime"
+	"runtime"
 	"os"
-//	"os/exec"
+	"os/exec"
 	"net"
 //	"bufio"
 	"bytes"
   "log"
-//  "fmt"
-//  "io/ioutil"
+  "fmt"
+  "io/ioutil"
 //  "reflect"
   "strconv"
+)
+
+
+const (
+	iptablesPath = "/usr/sbin/iptables"
 )
 
 type Container struct {
@@ -43,9 +48,9 @@ type firewall struct {
 
 type rules struct {
 	Source string
-  SourcePort int
+  SourcePort string
   Destination string
-  DestinationPort int
+  DestinationPort string 
   Proto string
   Type string
 }
@@ -64,24 +69,35 @@ func main() {
 		log.Printf("Using %s as search label", *LabelDef)
 	}
 
-  Firewall := &firewall{}
-// Input: []rules, Output: []rules, Forward: []rules }
-
 //  for {
 
     
-    containers, _:= get_containers()
-    for _, c:= range containers {
-			if *Debug {
-				log.Printf("Focus on Container: %s = %s", c.Id, c.PrimaryName())
-        c.GetRules( *Firewall )
+			containers, _:= get_containers()
+			for _, c:= range containers {
+				Firewall := &firewall{ }
+				Firewall.Input.Rules = make([]rules, 100)
+				Firewall.Output.Rules = make([]rules, 100)
+				Firewall.Forward.Rules = make([]rules, 100)
 
+				if *Debug {
+					log.Printf("Focus on Container: %s = %s", c.Id, c.PrimaryName())
+				}
+					c.GetRules( *Firewall )		
+
+        err := c.ApplyRules( *Firewall )
+				if err != nil {
+					log.Println("Error Applying Rules")
+				}
+
+					
+
+				if *Debug {
+//					Firewall.PrintRules()
+				}
 			}
-		}
 //	}
 
 
-  Firewall.PrintRules()
 }
 
 func get_containers() ([]Container, error) {
@@ -129,6 +145,22 @@ func (c Container) PrimaryName() string {
 	return primary_name
 }
 
+func (c Container) tasksFile() string {
+	return fmt.Sprintf("/sys/fs/cgroup/memory/system.slice/docker-%s.scope/tasks", c.Id)
+}
+
+func (c Container) firstPid() (int, error) {
+	data, err := ioutil.ReadFile(c.tasksFile())
+	if err != nil {
+		return -1, err
+	}
+	value, err := strconv.Atoi(strings.SplitN(string(data), "\n", 2)[0])
+	if err != nil {
+		return -1, err
+	}
+	return value, nil
+}
+
 func (c Container) GetRules(fw firewall) {
 
   for k, v := range c.Labels {
@@ -173,21 +205,110 @@ func (c Container) GetRules(fw firewall) {
   }
 }
 
+func (c Container) ApplyRules(fw firewall) error {
+
+	// Lock the OS Thread so we don't accidentally switch namespaces
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Save the current network namespace
+	origns, _ := netns.Get()
+	defer origns.Close()
+
+	// Create a new network namespace
+	pid, _ := c.firstPid()
+
+  log.Printf( "pid %v", pid)
+
+	newns, _ := netns.GetFromPid(pid)
+	defer newns.Close()
+
+	// Switch to the container namespace
+	netns.Set(newns)
+
+  // Input
+  for pos , rule := range fw.Input.Rules {
+  
+    if rule.Type != "" {
+			sport, _ := strconv.Atoi(rule.SourcePort)
+			dport, _ := strconv.Atoi(rule.DestinationPort)
+
+			if *Debug {
+				log.Printf( "ApplyRules - Source : %s SourcePort %v Destination : %s DestinationPort : %v Proto : %s Type : %s" , rule.Source , sport , rule.Destination, dport , rule.Proto, rule.Type  )
+			}
+
+      args := " -I INPUT " + strconv.Itoa( pos + 1 ) + " -p " + rule.Proto + " --source " + rule.Source + " --destination-port " + rule.DestinationPort + " -j " + strings.ToUpper(rule.Type)
+
+			if *Debug {
+				log.Printf( "ApplyRules cmd %s - args : %s", iptablesPath, args  )
+			}
+     
+      cmd := exec.Cmd{Path: iptablesPath, Args: append([]string{iptablesPath}, args)}
+
+
+  		if err := cmd.Run(); err != nil {
+        log.Fatal(err);
+	  		return err.(*exec.ExitError)
+		  }
+
+		}
+
+  }
+
+	// Switch back to the original namespace
+	netns.Set(origns)
+	runtime.UnlockOSThread()
+
+
+  return nil
+}
+
 func (f firewall) AddInputRule(pos int, rule string) {
   if *Debug {
-    log.Printf( "Pos : %v Rule %s" ,pos,rule )
+    log.Printf( "AddInputRule - Pos : %v Rule %s" ,pos,rule )
   }
-  f.Input.Rules[pos].Source = rule
+
+  var  R rules
+  err := json.Unmarshal([]byte(rule), &R )
+	if err != nil {
+    log.Println("Couldn't convert json label to rule")
+	}
+  
+  f.Input.Rules[pos] = R
+
 }
 
 func (f firewall) PrintRules() {
 
   for _ , rule := range f.Input.Rules {
+    if rule.Type != "" {
+			
+			sport, _ := strconv.Atoi(rule.SourcePort)
+			dport, _ := strconv.Atoi(rule.DestinationPort)
+			if *Debug {
+				log.Printf( "PrintRules Input Source : %s SourcePort %v Destination : %s DestinationPort : %v Proto : %s Type : %s" , rule.Source , sport , rule.Destination, dport , rule.Proto, rule.Type  )
+			}
+		}
 
-    if *Debug {
-      log.Printf( "Source : %s SourcePort %s" , rule.Source , rule.SourcePort )
-    }
+  }
+  for _ , rule := range f.Output.Rules {
+    if rule.Type != "" {
+			sport, _ := strconv.Atoi(rule.SourcePort)
+			dport, _ := strconv.Atoi(rule.DestinationPort)
+			if *Debug {
+				log.Printf( "PrintRules Output Source : %s SourcePort %v Destination : %s DestinationPort : %v Proto : %s Type : %s" , rule.Source , sport , rule.Destination, dport , rule.Proto, rule.Type  )
+			}
+		}
+  }
+  for _ , rule := range f.Forward.Rules {
+    if rule.Type != "" {
+			sport, _ := strconv.Atoi(rule.SourcePort)
+			dport, _ := strconv.Atoi(rule.DestinationPort)
+			if *Debug {
+				log.Printf( "PrintRules Forward Source : %s SourcePort %v Destination : %s DestinationPort : %v Proto : %s Type : %s" , rule.Source , sport , rule.Destination, dport , rule.Proto, rule.Type  )
+			}
 
+		}
   }
 }
 
