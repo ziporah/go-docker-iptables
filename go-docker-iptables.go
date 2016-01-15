@@ -16,6 +16,7 @@ import (
   "io/ioutil"
 //  "reflect"
   "strconv"
+//  "syscall"
 )
 
 
@@ -227,6 +228,14 @@ func (c Container) ApplyRules(fw firewall) error {
 	netns.Set(newns)
 
   // Input
+	cmd := append([]string{"-t", "filter", "-F", "INPUT"})
+	err := exec.Command(iptablesPath, cmd...).Run()
+
+	if err != nil {
+		log.Println("Couldn't apply clear rule")
+	}
+
+
   for pos , rule := range fw.Input.Rules {
   
     if rule.Type != "" {
@@ -236,21 +245,19 @@ func (c Container) ApplyRules(fw firewall) error {
 			if *Debug {
 				log.Printf( "ApplyRules - Source : %s SourcePort %v Destination : %s DestinationPort : %v Proto : %s Type : %s" , rule.Source , sport , rule.Destination, dport , rule.Proto, rule.Type  )
 			}
-
-      args := " -I INPUT " + strconv.Itoa( pos + 1 ) + " -p " + rule.Proto + " --source " + rule.Source + " --destination-port " + rule.DestinationPort + " -j " + strings.ToUpper(rule.Type)
+      ippos := pos+1
+      args := []string{"-t", "filter", "-I", "INPUT",  strconv.Itoa( ippos ) , "-p" , rule.Proto ,  "--source" ,  rule.Source , "--destination-port" , rule.DestinationPort,  "-j", strings.ToUpper(rule.Type) , "--wait"}
 
 			if *Debug {
 				log.Printf( "ApplyRules cmd %s - args : %s", iptablesPath, args  )
 			}
      
-      cmd := exec.Cmd{Path: iptablesPath, Args: append([]string{iptablesPath}, args)}
+      cmd := exec.Cmd{Path: iptablesPath, Args: append([]string{iptablesPath}, args...)}
+			err := cmd.Run()
 
-
-  		if err := cmd.Run(); err != nil {
-        log.Fatal(err);
-	  		return err.(*exec.ExitError)
-		  }
-
+			if err != nil {
+				log.Println("Couldn't apply rule %v", pos )
+			}
 		}
 
   }
